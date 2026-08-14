@@ -102,6 +102,15 @@ impl MultisigTreasury {
 
     /// Propose a change to the signer set and/or threshold. Applying it later is itself
     /// gated by the current signer set reaching threshold.
+    ///
+    /// Semantics for in-flight proposals (payment or signer-update alike): the
+    /// *target* of a proposal (payment details, or the new signer set/threshold) is
+    /// fixed at proposal time and never changes. The *approvals* on it, however, are
+    /// always counted against whichever signer set is current at execution time — so
+    /// if a rotation lands while another proposal is still pending, an approval from a
+    /// signer removed by that rotation stops counting (see `Proposal::approvals`).
+    /// This is deliberately stricter than proposal-time semantics: a since-removed
+    /// signer can never push something across the line after they've been rotated out.
     pub fn propose_signer_update(
         env: Env,
         proposer: Address,
