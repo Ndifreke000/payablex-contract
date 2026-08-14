@@ -435,6 +435,93 @@ fn removed_signer_approval_no_longer_counts() {
     assert_eq!(ctx.token.balance(&ctx.contract_id), FUNDING);
 }
 
+#[test]
+fn signer_update_rejects_bad_configs() {
+    let ctx = setup(3, 2);
+
+    // Threshold zero.
+    assert_eq!(
+        ctx.client
+            .try_propose_signer_update(&signer(&ctx, 0), &ctx.signers, &0),
+        Err(Ok(Error::InvalidThreshold))
+    );
+    // Threshold above the proposed signer count.
+    assert_eq!(
+        ctx.client
+            .try_propose_signer_update(&signer(&ctx, 0), &ctx.signers, &4),
+        Err(Ok(Error::InvalidThreshold))
+    );
+    // Empty signer set.
+    let empty: Vec<Address> = Vec::new(&ctx.env);
+    assert_eq!(
+        ctx.client
+            .try_propose_signer_update(&signer(&ctx, 0), &empty, &1),
+        Err(Ok(Error::InvalidSigners))
+    );
+    // Duplicate signer in the proposed set.
+    let dup: Vec<Address> = vec![&ctx.env, signer(&ctx, 0), signer(&ctx, 0)];
+    assert_eq!(
+        ctx.client
+            .try_propose_signer_update(&signer(&ctx, 0), &dup, &1),
+        Err(Ok(Error::DuplicateSigner))
+    );
+    // Only a current signer may propose a rotation.
+    let outsider = Address::generate(&ctx.env);
+    assert_eq!(
+        ctx.client
+            .try_propose_signer_update(&outsider, &ctx.signers, &2),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn signer_update_cannot_remove_signers_below_the_threshold_it_keeps() {
+    // 3 signers, threshold 2. Proposing to drop to a single signer while keeping
+    // threshold 2 would make the treasury permanently un-executable -> rejected
+    // up front rather than accepted and stuck.
+    let ctx = setup(3, 2);
+    let shrunk: Vec<Address> = vec![&ctx.env, signer(&ctx, 0)];
+    assert_eq!(
+        ctx.client
+            .try_propose_signer_update(&signer(&ctx, 0), &shrunk, &2),
+        Err(Ok(Error::InvalidThreshold))
+    );
+}
+
+#[test]
+fn signer_update_requires_full_current_threshold_to_execute() {
+    // Rotation is the highest-risk operation: it must not execute on fewer
+    // approvals than an ordinary payment would need.
+    let ctx = setup(3, 2);
+    let new_set: Vec<Address> = vec![&ctx.env, signer(&ctx, 0), signer(&ctx, 2)];
+    let id = ctx
+        .client
+        .propose_signer_update(&signer(&ctx, 0), &new_set, &2);
+    // Only the proposer has approved (1 of 2) -> execution must be rejected, and
+    // the old signer set/threshold must remain in force.
+    assert_eq!(
+        ctx.client.try_execute_signer_update(&id),
+        Err(Ok(Error::ThresholdNotMet))
+    );
+    assert_eq!(ctx.client.get_signers().len(), 3);
+    assert_eq!(ctx.client.get_threshold(), 2);
+}
+
+#[test]
+fn signer_update_double_execute_is_blocked() {
+    let ctx = setup(2, 2);
+    let new_set: Vec<Address> = vec![&ctx.env, signer(&ctx, 0), signer(&ctx, 1)];
+    let id = ctx
+        .client
+        .propose_signer_update(&signer(&ctx, 0), &new_set, &2);
+    ctx.client.approve(&signer(&ctx, 1), &id);
+    ctx.client.execute_signer_update(&id);
+    assert_eq!(
+        ctx.client.try_execute_signer_update(&id),
+        Err(Ok(Error::AlreadyExecuted))
+    );
+}
+
 // ---- Events ----
 
 #[test]
