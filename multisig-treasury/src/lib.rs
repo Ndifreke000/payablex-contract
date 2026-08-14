@@ -24,7 +24,7 @@ mod test;
 mod types;
 
 pub use error::Error;
-pub use types::{PaymentDetails, Proposal, ProposalKind, SignerUpdate};
+pub use types::{BatchItemResult, PaymentDetails, Proposal, ProposalKind, SignerUpdate};
 
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, BytesN, Env, String, Vec};
 use types::DataKey;
@@ -180,6 +180,34 @@ impl MultisigTreasury {
             (proposal_id, details.recipient, details.amount),
         );
         Ok(())
+    }
+
+    /// Execute a batch of already-approved payment proposals in one call. Atomic
+    /// *per item*: each id either fully executes (marked executed + transferred) or is
+    /// skipped and reported with a reason (not found, wrong kind, already executed,
+    /// threshold not met) — one item's failure never rolls back or blocks another's
+    /// success. The whole batch is blocked while paused, same as `execute_payment`.
+    pub fn execute_batch(env: Env, proposal_ids: Vec<u32>) -> Result<Vec<BatchItemResult>, Error> {
+        require_initialized(&env)?;
+        if read_paused(&env) {
+            return Err(Error::Paused);
+        }
+
+        let signers = read_signers(&env);
+        let threshold = read_threshold(&env);
+        let token = read_token(&env);
+
+        let mut results = Vec::new(&env);
+        for proposal_id in proposal_ids.iter() {
+            results.push_back(execute_batch_item(
+                &env,
+                proposal_id,
+                &signers,
+                threshold,
+                &token,
+            ));
+        }
+        Ok(results)
     }
 
     /// Apply an approved signer update. Not blocked by pause, so a compromised signer can
@@ -348,6 +376,59 @@ fn count_valid_approvals(current_signers: &Vec<Address>, approvals: &Vec<Address
         }
     }
     count
+}
+
+/// Execute one item of a batch. Never propagates an error out of the call — every
+/// rejection reason is reported back in the `BatchItemResult` instead, so a bad id
+/// among good ones can't sink the batch. Mirrors `execute_payment`'s guards exactly.
+fn execute_batch_item(
+    env: &Env,
+    proposal_id: u32,
+    signers: &Vec<Address>,
+    threshold: u32,
+    token: &Address,
+) -> BatchItemResult {
+    let skip = |error: Error| BatchItemResult {
+        proposal_id,
+        executed: false,
+        error: Some(error as u32),
+    };
+
+    let mut proposal = match read_proposal(env, proposal_id) {
+        Ok(p) => p,
+        Err(e) => return skip(e),
+    };
+    if proposal.executed {
+        return skip(Error::AlreadyExecuted);
+    }
+    let details = match &proposal.kind {
+        ProposalKind::Payment(d) => d.clone(),
+        ProposalKind::SignerUpdate(_) => return skip(Error::WrongProposalKind),
+    };
+    if count_valid_approvals(signers, &proposal.approvals) < threshold {
+        return skip(Error::ThresholdNotMet);
+    }
+
+    // Effects before interaction, same invariant as execute_payment.
+    proposal.executed = true;
+    write_proposal(env, &proposal);
+
+    token::Client::new(env, token).transfer(
+        &env.current_contract_address(),
+        &details.recipient,
+        &details.amount,
+    );
+
+    env.events().publish(
+        (symbol_short!("execute"),),
+        (proposal_id, details.recipient, details.amount),
+    );
+
+    BatchItemResult {
+        proposal_id,
+        executed: true,
+        error: None,
+    }
 }
 
 fn create_proposal(env: &Env, proposer: &Address, kind: ProposalKind) -> u32 {

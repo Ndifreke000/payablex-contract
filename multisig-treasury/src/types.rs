@@ -57,3 +57,14 @@ pub struct Proposal {
     pub approvals: Vec<Address>,
     pub executed: bool,
 }
+
+/// Outcome of a single proposal within `execute_batch`. `error` carries the
+/// `Error` discriminant (as `u32`) when `executed` is `false`, so callers can tell
+/// *why* an item was skipped without aborting the rest of the batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[contracttype]
+pub struct BatchItemResult {
+    pub proposal_id: u32,
+    pub executed: bool,
+    pub error: Option<u32>,
+}

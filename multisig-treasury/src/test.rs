@@ -435,6 +435,123 @@ fn removed_signer_approval_no_longer_counts() {
     assert_eq!(ctx.token.balance(&ctx.contract_id), FUNDING);
 }
 
+// ---- Batch execution ----
+
+#[test]
+fn execute_batch_mixed_valid_and_invalid() {
+    let ctx = setup(3, 2);
+    let recipient = Address::generate(&ctx.env);
+
+    // id 1: fully approved, should execute.
+    let ready = ctx.client.propose_payment(
+        &signer(&ctx, 0),
+        &invoice_hash(&ctx.env),
+        &recipient,
+        &100,
+        &memo(&ctx.env),
+    );
+    ctx.client.approve(&signer(&ctx, 1), &ready);
+
+    // id 2: only proposer approved, under threshold.
+    let under_approved = ctx.client.propose_payment(
+        &signer(&ctx, 0),
+        &invoice_hash(&ctx.env),
+        &recipient,
+        &50,
+        &memo(&ctx.env),
+    );
+
+    // id 3: doesn't exist.
+    let missing = 999u32;
+
+    // id 4: a signer-update proposal, wrong kind for batch execution.
+    let wrong_kind = ctx
+        .client
+        .propose_signer_update(&signer(&ctx, 0), &ctx.signers, &2);
+
+    let ids = vec![&ctx.env, ready, under_approved, missing, wrong_kind];
+    let results = ctx.client.execute_batch(&ids);
+
+    assert_eq!(results.len(), 4);
+    assert!(results.get(0).unwrap().executed);
+    assert_eq!(results.get(0).unwrap().error, None);
+
+    assert!(!results.get(1).unwrap().executed);
+    assert_eq!(
+        results.get(1).unwrap().error,
+        Some(Error::ThresholdNotMet as u32)
+    );
+
+    assert!(!results.get(2).unwrap().executed);
+    assert_eq!(
+        results.get(2).unwrap().error,
+        Some(Error::ProposalNotFound as u32)
+    );
+
+    assert!(!results.get(3).unwrap().executed);
+    assert_eq!(
+        results.get(3).unwrap().error,
+        Some(Error::WrongProposalKind as u32)
+    );
+
+    // Only the ready payment actually moved funds.
+    assert_eq!(ctx.token.balance(&recipient), 100);
+    assert_eq!(ctx.token.balance(&ctx.contract_id), FUNDING - 100);
+    assert!(ctx.client.get_proposal(&ready).executed);
+    assert!(!ctx.client.get_proposal(&under_approved).executed);
+}
+
+#[test]
+fn execute_batch_rejects_duplicate_id_in_same_batch() {
+    let ctx = setup(2, 2);
+    let recipient = Address::generate(&ctx.env);
+    let id = ctx.client.propose_payment(
+        &signer(&ctx, 0),
+        &invoice_hash(&ctx.env),
+        &recipient,
+        &100,
+        &memo(&ctx.env),
+    );
+    ctx.client.approve(&signer(&ctx, 1), &id);
+
+    // Same id twice: first execution succeeds, the second sees AlreadyExecuted.
+    let results = ctx.client.execute_batch(&vec![&ctx.env, id, id]);
+    assert!(results.get(0).unwrap().executed);
+    assert!(!results.get(1).unwrap().executed);
+    assert_eq!(
+        results.get(1).unwrap().error,
+        Some(Error::AlreadyExecuted as u32)
+    );
+    // Recipient paid exactly once, not twice.
+    assert_eq!(ctx.token.balance(&recipient), 100);
+}
+
+#[test]
+fn execute_batch_blocked_entirely_while_paused() {
+    let ctx = setup(2, 2);
+    let recipient = Address::generate(&ctx.env);
+    let id = ctx.client.propose_payment(
+        &signer(&ctx, 0),
+        &invoice_hash(&ctx.env),
+        &recipient,
+        &100,
+        &memo(&ctx.env),
+    );
+    ctx.client.approve(&signer(&ctx, 1), &id);
+
+    ctx.client.pause();
+    assert_eq!(
+        ctx.client.try_execute_batch(&vec![&ctx.env, id]),
+        Err(Ok(Error::Paused))
+    );
+    assert_eq!(ctx.token.balance(&recipient), 0);
+
+    ctx.client.unpause();
+    let results = ctx.client.execute_batch(&vec![&ctx.env, id]);
+    assert!(results.get(0).unwrap().executed);
+    assert_eq!(ctx.token.balance(&recipient), 100);
+}
+
 // ---- Events ----
 
 #[test]
