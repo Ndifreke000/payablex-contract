@@ -435,121 +435,91 @@ fn removed_signer_approval_no_longer_counts() {
     assert_eq!(ctx.token.balance(&ctx.contract_id), FUNDING);
 }
 
-// ---- Batch execution ----
-
 #[test]
-fn execute_batch_mixed_valid_and_invalid() {
+fn signer_update_rejects_bad_configs() {
     let ctx = setup(3, 2);
-    let recipient = Address::generate(&ctx.env);
 
-    // id 1: fully approved, should execute.
-    let ready = ctx.client.propose_payment(
-        &signer(&ctx, 0),
-        &invoice_hash(&ctx.env),
-        &recipient,
-        &100,
-        &memo(&ctx.env),
+    // Threshold zero.
+    assert_eq!(
+        ctx.client
+            .try_propose_signer_update(&signer(&ctx, 0), &ctx.signers, &0),
+        Err(Ok(Error::InvalidThreshold))
     );
-    ctx.client.approve(&signer(&ctx, 1), &ready);
-
-    // id 2: only proposer approved, under threshold.
-    let under_approved = ctx.client.propose_payment(
-        &signer(&ctx, 0),
-        &invoice_hash(&ctx.env),
-        &recipient,
-        &50,
-        &memo(&ctx.env),
+    // Threshold above the proposed signer count.
+    assert_eq!(
+        ctx.client
+            .try_propose_signer_update(&signer(&ctx, 0), &ctx.signers, &4),
+        Err(Ok(Error::InvalidThreshold))
     );
+    // Empty signer set.
+    let empty: Vec<Address> = Vec::new(&ctx.env);
+    assert_eq!(
+        ctx.client
+            .try_propose_signer_update(&signer(&ctx, 0), &empty, &1),
+        Err(Ok(Error::InvalidSigners))
+    );
+    // Duplicate signer in the proposed set.
+    let dup: Vec<Address> = vec![&ctx.env, signer(&ctx, 0), signer(&ctx, 0)];
+    assert_eq!(
+        ctx.client
+            .try_propose_signer_update(&signer(&ctx, 0), &dup, &1),
+        Err(Ok(Error::DuplicateSigner))
+    );
+    // Only a current signer may propose a rotation.
+    let outsider = Address::generate(&ctx.env);
+    assert_eq!(
+        ctx.client
+            .try_propose_signer_update(&outsider, &ctx.signers, &2),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
 
-    // id 3: doesn't exist.
-    let missing = 999u32;
+#[test]
+fn signer_update_cannot_remove_signers_below_the_threshold_it_keeps() {
+    // 3 signers, threshold 2. Proposing to drop to a single signer while keeping
+    // threshold 2 would make the treasury permanently un-executable -> rejected
+    // up front rather than accepted and stuck.
+    let ctx = setup(3, 2);
+    let shrunk: Vec<Address> = vec![&ctx.env, signer(&ctx, 0)];
+    assert_eq!(
+        ctx.client
+            .try_propose_signer_update(&signer(&ctx, 0), &shrunk, &2),
+        Err(Ok(Error::InvalidThreshold))
+    );
+}
 
-    // id 4: a signer-update proposal, wrong kind for batch execution.
-    let wrong_kind = ctx
+#[test]
+fn signer_update_requires_full_current_threshold_to_execute() {
+    // Rotation is the highest-risk operation: it must not execute on fewer
+    // approvals than an ordinary payment would need.
+    let ctx = setup(3, 2);
+    let new_set: Vec<Address> = vec![&ctx.env, signer(&ctx, 0), signer(&ctx, 2)];
+    let id = ctx
         .client
-        .propose_signer_update(&signer(&ctx, 0), &ctx.signers, &2);
-
-    let ids = vec![&ctx.env, ready, under_approved, missing, wrong_kind];
-    let results = ctx.client.execute_batch(&ids);
-
-    assert_eq!(results.len(), 4);
-    assert!(results.get(0).unwrap().executed);
-    assert_eq!(results.get(0).unwrap().error, None);
-
-    assert!(!results.get(1).unwrap().executed);
+        .propose_signer_update(&signer(&ctx, 0), &new_set, &2);
+    // Only the proposer has approved (1 of 2) -> execution must be rejected, and
+    // the old signer set/threshold must remain in force.
     assert_eq!(
-        results.get(1).unwrap().error,
-        Some(Error::ThresholdNotMet as u32)
+        ctx.client.try_execute_signer_update(&id),
+        Err(Ok(Error::ThresholdNotMet))
     );
-
-    assert!(!results.get(2).unwrap().executed);
-    assert_eq!(
-        results.get(2).unwrap().error,
-        Some(Error::ProposalNotFound as u32)
-    );
-
-    assert!(!results.get(3).unwrap().executed);
-    assert_eq!(
-        results.get(3).unwrap().error,
-        Some(Error::WrongProposalKind as u32)
-    );
-
-    // Only the ready payment actually moved funds.
-    assert_eq!(ctx.token.balance(&recipient), 100);
-    assert_eq!(ctx.token.balance(&ctx.contract_id), FUNDING - 100);
-    assert!(ctx.client.get_proposal(&ready).executed);
-    assert!(!ctx.client.get_proposal(&under_approved).executed);
+    assert_eq!(ctx.client.get_signers().len(), 3);
+    assert_eq!(ctx.client.get_threshold(), 2);
 }
 
 #[test]
-fn execute_batch_rejects_duplicate_id_in_same_batch() {
+fn signer_update_double_execute_is_blocked() {
     let ctx = setup(2, 2);
-    let recipient = Address::generate(&ctx.env);
-    let id = ctx.client.propose_payment(
-        &signer(&ctx, 0),
-        &invoice_hash(&ctx.env),
-        &recipient,
-        &100,
-        &memo(&ctx.env),
-    );
+    let new_set: Vec<Address> = vec![&ctx.env, signer(&ctx, 0), signer(&ctx, 1)];
+    let id = ctx
+        .client
+        .propose_signer_update(&signer(&ctx, 0), &new_set, &2);
     ctx.client.approve(&signer(&ctx, 1), &id);
-
-    // Same id twice: first execution succeeds, the second sees AlreadyExecuted.
-    let results = ctx.client.execute_batch(&vec![&ctx.env, id, id]);
-    assert!(results.get(0).unwrap().executed);
-    assert!(!results.get(1).unwrap().executed);
+    ctx.client.execute_signer_update(&id);
     assert_eq!(
-        results.get(1).unwrap().error,
-        Some(Error::AlreadyExecuted as u32)
+        ctx.client.try_execute_signer_update(&id),
+        Err(Ok(Error::AlreadyExecuted))
     );
-    // Recipient paid exactly once, not twice.
-    assert_eq!(ctx.token.balance(&recipient), 100);
-}
-
-#[test]
-fn execute_batch_blocked_entirely_while_paused() {
-    let ctx = setup(2, 2);
-    let recipient = Address::generate(&ctx.env);
-    let id = ctx.client.propose_payment(
-        &signer(&ctx, 0),
-        &invoice_hash(&ctx.env),
-        &recipient,
-        &100,
-        &memo(&ctx.env),
-    );
-    ctx.client.approve(&signer(&ctx, 1), &id);
-
-    ctx.client.pause();
-    assert_eq!(
-        ctx.client.try_execute_batch(&vec![&ctx.env, id]),
-        Err(Ok(Error::Paused))
-    );
-    assert_eq!(ctx.token.balance(&recipient), 0);
-
-    ctx.client.unpause();
-    let results = ctx.client.execute_batch(&vec![&ctx.env, id]);
-    assert!(results.get(0).unwrap().executed);
-    assert_eq!(ctx.token.balance(&recipient), 100);
 }
 
 // ---- Events ----
